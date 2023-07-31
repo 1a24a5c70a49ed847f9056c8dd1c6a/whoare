@@ -208,6 +208,12 @@ class Target:
     def doLookup(self, whoisMap, strangeList, dnsCache=None, whoisCache=None):
         raise NotImplementedError()
 
+    def toDict(self):
+        return {
+            'targetDescription' : str(self.targetDescription),
+            'comment' : self.comment
+        }
+
     def toJSON(self):
         return json.dumps(self.toDict(), sort_keys=True, indent=JSON_INDENT)
 
@@ -221,7 +227,7 @@ class TargetIP(Target):
 
     # required for serialization to JSON
     def toDict(self):
-        dictObj = self.__dict__
+        dictObj = super().toDict()
         dictObj['type'] = Target.TYPE_IP
         return dictObj
 
@@ -235,7 +241,7 @@ class TargetIPRange(Target):
 
     # required for serialization to JSON
     def toDict(self):
-        dictObj = self.__dict__
+        dictObj = super().toDict()
         dictObj['type'] = Target.TYPE_IP_RANGE
         return dictObj
 
@@ -249,7 +255,7 @@ class TargetDomain(Target):
 
     # required for serialization to JSON
     def toDict(self):
-        dictObj = self.__dict__
+        dictObj = super().toDict()
         dictObj['type'] = Target.TYPE_DOMAIN
         return dictObj
 
@@ -270,7 +276,8 @@ class ResultItem:
     DEFAULT_TEMPLATE = '{{__IP__}} {{(__DOMAIN__)}} {{[__COMMENT__]}}'
 
     def fromDict(d):
-        return ResultItem(d['inputItem'], d['ip'], d['domain'])
+        target = Target.fromDict(d['inputItem'])
+        return ResultItem(target, d['ip'], d['domain'])
 
     def fromJSON(jsonString):
         return ResultItem.fromDict(json.loads(jsonString))
@@ -310,6 +317,12 @@ class WhoisLine:
     LINE_TAG_EVIDENCE = 'evidence'
     LINE_TAG_INFO = 'info'
 
+    def fromDict(d):
+       return WhoisLine(d['preMatch'], d['match'], d['postMatch'], d['number'], d['tag']) 
+
+    def fromJSON(jsonString):
+        return WhoisLine.fromDict(json.loads(jsonString))
+
     def __init__(self, textPreMatch, textMatch, textPostMatch, number, tag):
         self.preMatch = textPreMatch
         self.match = textMatch
@@ -320,35 +333,57 @@ class WhoisLine:
     def format(self, matchPrefix='', matchSuffix=''):
         return self.preMatch + matchPrefix + self.match + matchSuffix + self.postMatch
 
-    # TODO: to and from JSON
+    def toDict(self):
+        return self.__dict__
 
+    def toJSON(self):
+        return json.dumps(self.toDict())
+        
 
 class WhoisGroup:
     """
     A group of IP ranges or IPs with the same whois entry.    
     """
 
-    def __init__(self, whois, resultList):
+    def fromDict(d):
+        rLines = d['resultList']
+        resultList = [ResultItem.fromDict(ri) for ri in rLines]
+
+        wLines = d['whoisLines']
+        whoisLines = [WhoisLine.fromDict(wl) for wl in wLines]
+        whoisGroup = WhoisGroup(d['whois'], resultList, whoisLines)
+        return whoisGroup
+
+    def fromJSON(jsonString):
+        return WhoisGroup.fromDict(json.loads(jsonString))
+
+    def __init__(self, whois, resultList, whoisLines=[]):
         self.whois = whois
         self.resultList = resultList
-        self.whoisLines = []
+        self.whoisLines = whoisLines
 
     def addLine(self, preMatch, match, postMatch, num, tag):
         self.whoisLines.append(WhoisLine(preMatch, match, postMatch, num, tag))
 
     def format(self, resultLineTemplate=ResultItem.DEFAULT_TEMPLATE, matchPrefix='', matchSuffix='', suppressWhoisLines=False):
-
-        outLines = []
-        for resultItem in self.resultList:
-            outLines.append(resultItem.format(resultLineTemplate)) 
+        outLines = [ri.format(resultLineTemplate) for ri in self.resultList]
         
-        if suppressWhoisLines:
-            return '\n'.join(outLines) + '\n'
-
-        for line in self.whoisLines:
-            outLines.append(line.format(matchPrefix, matchSuffix))
+        if not suppressWhoisLines:
+            for line in self.whoisLines:
+                outLines.append(line.format(matchPrefix, matchSuffix))
 
         return '\n'.join(outLines) + '\n'
+
+    def toDict(self):
+        return {
+            'whois' : self.whois,
+            'resultList' : [r.toDict() for r in self.resultList],
+            'whoisLines' : [l.toDict() for l in self.whoisLines]
+        }
+
+    def toJSON(self):
+        return json.dumps(self.toDict())
+        
 
 
 #    def formatLatex(self, whoisLineTemplate, whoisPreMatch='', whoisPostMatch='',
@@ -378,8 +413,6 @@ class WhoisGroup:
 #        return '\n'.join(outLines) + '\n' 
 
     
-    # TODO: to and from JSON
-
 class DNSCache:
     def __init__(self, cacheDir=None):
         self.cacheDir = cacheDir
@@ -509,14 +542,14 @@ def groupByMatch(resultEntries, matchPhrases, infoPhrases, caseSensitiveMatch=Tr
     matchPhrases = matchPhrases if caseSensitiveMatch else [p.lower() for p in matchPhrases]
     infoPhrases = infoPhrases if caseSensitiveInfo else [p.lower() for p in infoPhrases]
     for k, v in resultEntries.items():
-        (a, rawWhois) = v
+        (resultItemList, rawWhois) = v
         matchWhois = rawWhois if caseSensitiveMatch else rawWhois.lower()
         infoWhois = rawWhois if caseSensitiveInfo else rawWhois.lower()
 
         mPhrases = [p for p in matchPhrases if p in matchWhois]
         iPhrases = [p for p in infoPhrases if p in infoWhois]
 
-        group = WhoisGroup(k, a)
+        group = WhoisGroup(k, resultItemList)
 
         if mPhrases:
             matched.append(group)
@@ -572,6 +605,19 @@ def exportRanges(groups, filePath, templateString):
     output = formatGroups(groups, templateString, True)
     with open(filePath, 'w') as outfile:
         outfile.write(output)
+
+# export WhoisGroups as JSON
+def exportJOSN(matched, unmatched, filePath):
+    dictObj = {
+        'matched' : [m.toDict() for m in matched],
+        'unmatched' : [u.toDict() for u in unmatched]
+    } 
+
+    with open(filePath, 'w') as outfile:
+        outfile.write(json.dumps(dictObj))
+
+
+# TODO: import from JSON
 
 def main():
     ap = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
@@ -663,9 +709,21 @@ def main():
     dnsCache.writeToDir()
     whoisCache.writeToDir()
 
-
     (matched, unmatched) = groupByMatch(whoisMap, matchPhrases, infoPhrases, 
         caseSensitiveMatch=not args.match_ignore_case, caseSensitiveInfo=not args.info_ignore_case)
+
+    # TODO remove
+    for u in unmatched:
+        s = u.toJSON()
+        u2 = WhoisGroup.fromJSON(s)
+        s2 = u2.toJSON()
+        print('## origJSON:')
+        print(s)
+    
+        print('## recovJSON:')
+        print(s2)
+
+    exportJOSN(matched, unmatched, 'out.json')
 
     exportTemplate = args.export_format if args.export_format else '{{__IP__}}{{ # (__DOMAIN__)}}{{ # [__COMMENT__]}}'
     if args.export_matched:
