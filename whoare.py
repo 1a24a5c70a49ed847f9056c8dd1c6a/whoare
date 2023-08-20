@@ -9,6 +9,9 @@ import subprocess
 import sys
 import validators
 
+DEFAULTDIR_DNSCACHE = '.dnscache'
+DEFAULTDIR_WHOISCACHE = '.whoiscache'
+
 JSON_INDENT = 2
 
 RE_DNS_ARECORD = re.compile('IN\s+A')
@@ -18,6 +21,9 @@ RE_DNS_ARECORD = re.compile('IN\s+A')
 RE_IP4 = re.compile('(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)')
 RE_IP6 = re.compile('(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))')
 
+# sort policies applied across groups (not to individual elements inside a group)
+SORT_GROUPS_NONE = 'none'
+SORT_GROUPS_ASC_BY_SMALLEST_MEMBER = 'ascending by smallest result member'
 
 class Logger:
     warnCnt = 0
@@ -59,12 +65,12 @@ def extractIPs(dnsRecord):
     lines = dnsRecord.splitlines()
     relevantLines = []
     relevantLines = [l for l in lines if re.findall(RE_DNS_ARECORD, l)]
-    
+
     ips = set()
     for l in relevantLines:
        ips.update(re.findall(RE_IP4, l))
        ips.update(re.findall(RE_IP6, l))
-    
+
     return list(ips)
 
 
@@ -126,16 +132,16 @@ def writeMapToDir(directory, inputMap):
                 outfile.write(result)
             else:
                 outfile.write(result.decode('utf-8'))
-                
+
     mappingFilePath = os.path.join(directory, '_mapping')
     with open(mappingFilePath, 'w') as outMappingFile:
         outMappingFile.write('\n'.join(mappingLines))
-         
+
 
 def readMapFromDir(directory, mappingFile='_mapping'):
     mapping = os.path.join(directory, mappingFile)
     cacheMap = {}
-    
+
     try:
         with open(mapping, 'r') as mappingFile:
             mappingLines = [l.strip() for l in mappingFile]
@@ -150,7 +156,7 @@ def readMapFromDir(directory, mappingFile='_mapping'):
                 cacheMap[query] = contentFile.read()
         except FileNotFoundError as e:
             Logger.logWarning(f'{e}')
-    
+
     return cacheMap
 
 
@@ -171,12 +177,22 @@ def fillinPattern(templateString, regex, replaceMap):
             if placeholder in matchText:
                 replacement = replaceMap[placeholder]
                 middle = '' if replacement == None else matchText[2:-2].replace(placeholder, replacement)
-                tmp = pre + middle  + post 
+                tmp = pre + middle  + post
                 replaced = True
                 break
         if not replaced:
             tmp = pre + post
- 
+
+
+def getIPsortKey(item):
+    if isinstance(item.ip, ipaddress.IPv4Address) or isinstance(item.ip, ipaddress.IPv6Address):
+        return item.ip
+    return item.ip[0]
+
+def getMinBase(group):
+    results = [r for r in group.resultList]
+    sortedResults = sorted(results, key=getIPsortKey)
+    return ipaddress.ip_network(sortedResults[0].ip)
 
 class Target:
     """
@@ -318,7 +334,7 @@ class WhoisLine:
     LINE_TAG_INFO = 'info'
 
     def fromDict(d):
-       return WhoisLine(d['preMatch'], d['match'], d['postMatch'], d['number'], d['tag']) 
+       return WhoisLine(d['preMatch'], d['match'], d['postMatch'], d['number'], d['tag'])
 
     def fromJSON(jsonString):
         return WhoisLine.fromDict(json.loads(jsonString))
@@ -338,12 +354,16 @@ class WhoisLine:
 
     def toJSON(self):
         return json.dumps(self.toDict())
-        
+
 
 class WhoisGroup:
     """
-    A group of IP ranges or IPs with the same whois entry.    
+    A group of IP ranges or IPs with the same whois entry.
     """
+
+    SORT_POLICY_NONE = 'input order'
+    SORT_POLICY_IP_NUM_ASC = 'IP numerical ascending'
+    SORT_POLICY_IP_NUM_DSC = 'IP numerical descending'
 
     def fromDict(d):
         rLines = d['resultList']
@@ -365,9 +385,18 @@ class WhoisGroup:
     def addLine(self, preMatch, match, postMatch, num, tag):
         self.whoisLines.append(WhoisLine(preMatch, match, postMatch, num, tag))
 
-    def format(self, resultLineTemplate=ResultItem.DEFAULT_TEMPLATE, matchPrefix='', matchSuffix='', suppressWhoisLines=False):
+    def sort(self, sortPolicy):
+
+        if sortPolicy == WhoisGroup.SORT_POLICY_NONE:
+            return
+            #key = str(resultItem.ip).split('/')[0].split('.')
+            #return [int(k) for k in key]
+
+        self.resultList = sorted(self.resultList, key=getIPsortKey, reverse=(sortPolicy == WhoisGroup.SORT_POLICY_IP_NUM_DSC))
+
+    def format(self, resultLineTemplate=ResultItem.DEFAULT_TEMPLATE, matchPrefix='', matchSuffix='', suppressWhoisLines=False, sortPolicy=SORT_POLICY_IP_NUM_ASC):
         outLines = [ri.format(resultLineTemplate) for ri in self.resultList]
-        
+
         if not suppressWhoisLines:
             for line in self.whoisLines:
                 outLines.append(line.format(matchPrefix, matchSuffix))
@@ -383,15 +412,13 @@ class WhoisGroup:
 
     def toJSON(self):
         return json.dumps(self.toDict())
-        
-
 
 #    def formatLatex(self, whoisLineTemplate, whoisPreMatch='', whoisPostMatch='',
 #    TODO: implement in separate tool
-#        digDomains=True, preDig='§B[# ', postDig=']B§', 
+#        digDomains=True, preDig='§B[# ', postDig=']B§',
 #        whoisIP=True, preWhois='§B[# ', postWhois=']B§',
 #        ellipsis='§[\\sygray{\\lbrack...\\rbrack}]§'):
-#        
+#
 #        outLines = []
 #        for resultItem in self.resultList:
 #           if digDomains and resultItem.domain:
@@ -405,21 +432,21 @@ class WhoisGroup:
 #        prevLineNum = -1
 #        for line in self.whoisLines:
 #            if ellipsis and prevLineNum < line.number - 1:
-#               outLines.append(ellipsis) 
+#               outLines.append(ellipsis)
 #            outLines.append(line.format(whoisPreMatch, whoisPostMatch))
 #            prevLineNum = line.number
 #            # TODO: possible ellipsis after last line
 #
-#        return '\n'.join(outLines) + '\n' 
+#        return '\n'.join(outLines) + '\n'
 
-    
+
 class DNSCache:
     def __init__(self, cacheDir=None):
         self.cacheDir = cacheDir
         self.cacheMap = {}
 
         if os.path.isdir(self.cacheDir):
-            self.cacheMap = readMapFromDir(cacheDir) if cacheDir else {} 
+            self.cacheMap = readMapFromDir(cacheDir) if cacheDir else {}
 
 
     def lookup(self, domainString):
@@ -440,7 +467,7 @@ class WhoisCache:
         self.cacheMap = {}
 
         if os.path.isdir(self.cacheDir):
-            self.cacheMap = readMapFromDir(cacheDir) if cacheDir else {} 
+            self.cacheMap = readMapFromDir(cacheDir) if cacheDir else {}
 
 
     def lookup(self, ipString):
@@ -459,7 +486,7 @@ class WhoisCache:
 def parseInput(inputLines, commentStart='#', rangeSeparator='-'):
     """
      tries to interpret the given string as IP address or range and process it accordingly
-      1) a single IP address (e.g. 2.133.7.42 
+      1) a single IP address (e.g. 2.133.7.42
       2) an IP range in CIDR notation (e.g. 66.7.83.0/24)
       3) an IP range in dash notation (e.g. 1.1.1.4 - 1.1.1.21)
          note: blocks in this notation will be spolit in appropriate blocks
@@ -505,7 +532,7 @@ def parseInput(inputLines, commentStart='#', rangeSeparator='-'):
 
         return None
 
-    inputItems = [] 
+    inputItems = []
     for num, line in enumerate(inputLines):
         line = line.strip()
         if line.startswith(commentStart) or not line:
@@ -516,7 +543,7 @@ def parseInput(inputLines, commentStart='#', rangeSeparator='-'):
         if not items:
             Logger.logWarning(f'Cannot parse line {num+1}: {line}')
             continue
-        
+
         inputItems.extend(items)
 
     return inputItems
@@ -526,7 +553,7 @@ def groupByMatch(resultEntries, matchPhrases, infoPhrases, caseSensitiveMatch=Tr
     def _extractMatch(line, phrase, caseSensitive):
         matchLine = line if caseSensitive else line.lower()
         phrase = phrase if caseSensitive else phrase.lower()
-            
+
         i = matchLine.find(phrase)
         if i == -1:
             return None
@@ -534,11 +561,10 @@ def groupByMatch(resultEntries, matchPhrases, infoPhrases, caseSensitiveMatch=Tr
         match = line[i : i + len(phrase)]
         postMatch = line[i + len(phrase) : ]
         return (preMatch, match, postMatch)
- 
+
     matched = []
     unmatched = []
-    
-    
+
     matchPhrases = matchPhrases if caseSensitiveMatch else [p.lower() for p in matchPhrases]
     infoPhrases = infoPhrases if caseSensitiveInfo else [p.lower() for p in infoPhrases]
     for k, v in resultEntries.items():
@@ -563,7 +589,7 @@ def groupByMatch(resultEntries, matchPhrases, infoPhrases, caseSensitiveMatch=Tr
                 m = _extractMatch(l, p, caseSensitiveMatch)
                 if m and not m in lineTexts:
                     (preMatch, match, postMatch) = m
-                    group.addLine(preMatch, match, postMatch, i, WhoisLine.LINE_TAG_EVIDENCE)                
+                    group.addLine(preMatch, match, postMatch, i, WhoisLine.LINE_TAG_EVIDENCE)
                     lineTexts.add(m)
                     break
 
@@ -571,10 +597,10 @@ def groupByMatch(resultEntries, matchPhrases, infoPhrases, caseSensitiveMatch=Tr
                 m = _extractMatch(l, p, caseSensitiveInfo)
                 if m and not m in lineTexts:
                     (preMatch, match, postMatch) = m
-                    group.addLine(preMatch, match, postMatch, i, WhoisLine.LINE_TAG_INFO)                
+                    group.addLine(preMatch, match, postMatch, i, WhoisLine.LINE_TAG_INFO)
                     lineTexts.add(m)
                     break
-            
+
     return (matched, unmatched)
 
 
@@ -585,8 +611,8 @@ def formatGroups(groups, templateString, suppressWhois=False):
 # TODO rework in seperate tool
 #def formatGroupsLatex(groups, templateString):
 #    latexString = [g.formatLatex(templateString) for g in groups]
-#    return '\\begin{prettylisting}\n' + '\n'.join(latexString) + '\\end{prettylisting}' 
-    
+#    return '\\begin{prettylisting}\n' + '\n'.join(latexString) + '\\end{prettylisting}'
+
 
 def printResults(matchedGroups, unmatchedGroups, templateString):
     matchedOutput = formatGroups(matchedGroups, templateString)
@@ -602,36 +628,35 @@ def printResults(matchedGroups, unmatchedGroups, templateString):
 
 # writes only the IPs and range lines into give file (no lines from whis entries)
 def exportRanges(groups, filePath, templateString):
-    output = formatGroups(groups, templateString, True)
+    output = formatGroups(groups, templateString, suppressWhois=True)
     with open(filePath, 'w') as outfile:
         outfile.write(output)
 
 # export WhoisGroups as JSON
-def exportJOSN(matched, unmatched, filePath):
+def exportJSON(matched, unmatched, filePath):
     dictObj = {
         'matched' : [m.toDict() for m in matched],
         'unmatched' : [u.toDict() for u in unmatched]
-    } 
+    }
 
     with open(filePath, 'w') as outfile:
         outfile.write(json.dumps(dictObj))
 
 
-# TODO: import from JSON
-
-def main():
+def getArgs():
     ap = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
-    ap.add_argument('-if', '--inputfile', type=str, required=True, help=(  
-        'File containing IP ranges and/or domais (one entry per line)\n'
-        'Comments (initiated by #) at end of line can be passed to output'
+    ap.add_argument('-if', '--inputfile', type=str, required=True, help=(
+        'File containing IP ranges and/or domais (one entry per line).\n'
+        'Comments (initiated by #) at end of line can be passed to output.\n'
+        'Empty lines and lines starting with #-symbols are ignored.'
     ))
 
     ap.add_argument('-dc', '--dnscache', type=str, help=(
-        'Directory to use for DNS cache'
+        f'Directory to use for DNS cache (default is .dnscache)'
     ))
 
     ap.add_argument('-wc', '--whoiscache', type=str, help=(
-        'Directory to use for whois cache'
+        'Directory to use for whois cache (default is .whoiscache).'
     ))
 
     ap.add_argument('-mp', '--match-phrases', type=str, help=(
@@ -662,7 +687,7 @@ def main():
     ap.add_argument('-em', '--export-matched', type=str, help=(
         'Specify file to export the matched IPs and ranges (without the whois output lines)'
     ))
-    
+
     ap.add_argument('-eu', '--export-unmatched', type=str, help=(
         'Specify file to export the unmatched IPs and ranges (without the whois output lines)'
     ))
@@ -671,7 +696,7 @@ def main():
         'Specify the format for the exported IPs an ranges.\n'
         'For details see help for option --output-format.'
     ))
- 
+
     ap.add_argument('-mic', '--match-ignore-case', action='store_true', help=(
         'Ignore case for match phrases in whois entries.'
     ))
@@ -680,8 +705,17 @@ def main():
         'Ignore case for informational phrases in whois entries.'
     ))
 
+    return ap.parse_args()
 
-    args = ap.parse_args()
+
+# TODO: import from JSON
+
+def main():
+    # TODO set via args
+    intraGroupSortPolicy = WhoisGroup.SORT_POLICY_IP_NUM_ASC
+    interGroupSortPolicy = SORT_GROUPS_ASC_BY_SMALLEST_MEMBER
+
+    args = getArgs()
 
     with open(args.inputfile, 'r') as inFile:
         inputLines = [l for l in inFile]
@@ -689,12 +723,14 @@ def main():
     matchPhrases = []
     if args.match_phrases:
         with open(args.match_phrases, 'r') as matchfile:
-            matchPhrases = [l.strip() for l in matchfile] 
+            matchPhrases = [l.strip() for l in matchfile if l.strip()]
+        matchPhrases = [m for m in matchPhrases if m]
 
     infoPhrases = []
     if args.info_phrases:
         with open(args.info_phrases, 'r') as infofile:
-            infoPhrases = [l.strip() for l in infofile]
+            infoPhrases = [l.strip() for l in infofile if l.strip()]
+        infoPhrases = [i for i in infoPhrases if i]
 
     inputItems = parseInput(inputLines)
 
@@ -709,35 +745,34 @@ def main():
     dnsCache.writeToDir()
     whoisCache.writeToDir()
 
-    (matched, unmatched) = groupByMatch(whoisMap, matchPhrases, infoPhrases, 
+    (matched, unmatched) = groupByMatch(whoisMap, matchPhrases, infoPhrases,
         caseSensitiveMatch=not args.match_ignore_case, caseSensitiveInfo=not args.info_ignore_case)
 
-    # TODO remove
-    for u in unmatched:
-        s = u.toJSON()
-        u2 = WhoisGroup.fromJSON(s)
-        s2 = u2.toJSON()
-        print('## origJSON:')
-        print(s)
-    
-        print('## recovJSON:')
-        print(s2)
+    if interGroupSortPolicy == SORT_GROUPS_ASC_BY_SMALLEST_MEMBER:
+        matched = sorted(matched, key=getMinBase)
+        unmatched = sorted(unmatched, key=getMinBase)
 
-    exportJOSN(matched, unmatched, 'out.json')
+    for g in matched:
+        g.sort(intraGroupSortPolicy)
+    for g in unmatched:
+        g.sort(intraGroupSortPolicy)
+
+    # TODO option
+    exportJSON(matched, unmatched, 'out.json')
 
     exportTemplate = args.export_format if args.export_format else '{{__IP__}}{{ # (__DOMAIN__)}}{{ # [__COMMENT__]}}'
     if args.export_matched:
         exportRanges(matched, args.export_matched, exportTemplate)
-    
+
     if args.export_unmatched:
-        exportRanges(unmatched, args.export_matched, exportTemplate)
-        
+        exportRanges(unmatched, args.export_unmatched, exportTemplate)
+
     outputTemplate = args.output_format if args.output_format else '{{__IP__}}{{ (__DOMAIN__)}}{{ [__COMMENT__]}}'
     printResults(matched, unmatched, outputTemplate)
-    
+
     warnCnt = Logger.warnCnt
     if warnCnt > 0:
         print(f'There were {warnCnt} warnings. Go read them!')
-    
+
 if __name__ == '__main__':
     main()
