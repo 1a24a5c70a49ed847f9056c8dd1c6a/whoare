@@ -377,10 +377,10 @@ class WhoisGroup:
     def fromJSON(jsonString):
         return WhoisGroup.fromDict(json.loads(jsonString))
 
-    def __init__(self, whois, resultList, whoisLines=[]):
+    def __init__(self, whois, resultList):
         self.whois = whois
         self.resultList = resultList
-        self.whoisLines = whoisLines
+        self.whoisLines = []
 
     def addLine(self, preMatch, match, postMatch, num, tag):
         self.whoisLines.append(WhoisLine(preMatch, match, postMatch, num, tag))
@@ -562,6 +562,14 @@ def groupByMatch(resultEntries, matchPhrases, infoPhrases, caseSensitiveMatch=Tr
         postMatch = line[i + len(phrase) : ]
         return (preMatch, match, postMatch)
 
+    def _isDuplicate(match, lineCache):
+        if not match:
+            return False
+        line = ''.join(list(match))
+        isDuplicate = line in lineCache
+        lineCache.add(line)
+        return isDuplicate
+
     matched = []
     unmatched = []
 
@@ -582,26 +590,24 @@ def groupByMatch(resultEntries, matchPhrases, infoPhrases, caseSensitiveMatch=Tr
         else:
             unmatched.append(group)
 
-        lineTexts = set() # for deduplication
+        lineCache = set() # for deduplication
         whoisLines = rawWhois.splitlines()
         for i, l in enumerate(whoisLines):
             for p in mPhrases:
                 m = _extractMatch(l, p, caseSensitiveMatch)
-                if m and not m in lineTexts:
+                if m and not _isDuplicate(m, lineCache):
                     (preMatch, match, postMatch) = m
                     group.addLine(preMatch, match, postMatch, i, WhoisLine.LINE_TAG_EVIDENCE)
-                    lineTexts.add(m)
                     break
 
             for p in iPhrases:
                 m = _extractMatch(l, p, caseSensitiveInfo)
-                if m and not m in lineTexts:
+                if m and not _isDuplicate(m, lineCache):
                     (preMatch, match, postMatch) = m
                     group.addLine(preMatch, match, postMatch, i, WhoisLine.LINE_TAG_INFO)
-                    lineTexts.add(m)
                     break
 
-    return (matched, unmatched)
+    return (matched, unmatched) 
 
 
 def formatGroups(groups, templateString, suppressWhois=False):
